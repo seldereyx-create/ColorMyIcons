@@ -1,0 +1,266 @@
+name: Build ColorMyIcons
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Install tools
+        run: brew install ldid dpkg
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Get iOS SDK
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git $HOME/sdks
+          cd $HOME/sdks
+          git sparse-checkout set iPhoneOS14.5.sdk
+          mkdir -p $HOME/theos/sdks
+          cp -R iPhoneOS14.5.sdk $HOME/theos/sdks/
+
+      - name: Create project files
+        run: |
+          mkdir -p $HOME/proj && cd $HOME/proj
+          cat > Makefile <<'CMI_EOF'
+          TARGET = iphone:clang:14.5:12.0
+          ARCHS = arm64
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = ColorMyIcons
+          ColorMyIcons_FILES = Tweak.x
+          ColorMyIcons_FRAMEWORKS = UIKit CoreImage
+
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          SUBPROJECTS += colormyiconsprefs
+          include $(THEOS_MAKE_PATH)/aggregate.mk
+          CMI_EOF
+          cat > control <<'CMI_EOF'
+          Package: com.jorik28.colormyicons
+          Name: ColorMyIcons
+          Depends: mobilesubstrate, preferenceloader
+          Version: 0.0.1
+          Architecture: iphoneos-arm
+          Description: Tinted-иконки как в iOS 18 (чистый вайбкодинг)
+          Author: Claude, Jorik28
+          Maintainer: Jorik28
+          Section: Tweaks
+          CMI_EOF
+          cat > ColorMyIcons.plist <<'CMI_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>Filter</key><dict><key>Bundles</key><array><string>com.apple.springboard</string></array></dict></dict></plist>
+          CMI_EOF
+          cat > Tweak.x <<'CMI_EOF'
+          // ColorMyIcons by Claude & Jorik28 -- pure vibe coding
+          #import <UIKit/UIKit.h>
+          #import <CoreImage/CoreImage.h>
+          #import <objc/runtime.h>
+
+          @interface SBIconImageView : UIView
+          - (UIImage *)contentsImage;
+          @end
+
+          @interface SBIconView : UIView
+          @end
+
+          static NSUserDefaults *prefs(void) {
+              static NSUserDefaults *p;
+              if (!p) p = [[NSUserDefaults alloc] initWithSuiteName:@"com.jorik28.colormyicons"];
+              return p;
+          }
+
+          static float val(NSString *k, float def) {
+              id o = [prefs() objectForKey:k];
+              return o ? [o floatValue] : def;
+          }
+
+          static char kCacheKey;
+
+          static UIImage *tinted(UIImage *src) {
+              if (!src || !src.CGImage) return src;
+              UIImage *cached = objc_getAssociatedObject(src, &kCacheKey);
+              if (cached) return cached;
+
+              CGSize sz = src.size;
+              CGFloat sc = src.scale;
+              CGRect r = CGRectMake(0, 0, sz.width, sz.height);
+
+              CIImage *ci = [CIImage imageWithCGImage:src.CGImage];
+              CIFilter *ctl = [CIFilter filterWithName:@"CIColorControls"];
+              [ctl setValue:ci forKey:kCIInputImageKey];
+              [ctl setValue:@(0.0) forKey:kCIInputSaturationKey];
+              [ctl setValue:@(1.3) forKey:kCIInputContrastKey];
+              [ctl setValue:@(-0.15) forKey:kCIInputBrightnessKey];
+
+              CIFilter *mono = [CIFilter filterWithName:@"CIColorMonochrome"];
+              [mono setValue:ctl.outputImage forKey:kCIInputImageKey];
+              [mono setValue:[CIColor colorWithRed:val(@"r", 0.35) green:val(@"g", 0.55) blue:val(@"b", 1.0)]
+                      forKey:kCIInputColorKey];
+              [mono setValue:@(1.0) forKey:kCIInputIntensityKey];
+
+              static CIContext *cctx;
+              if (!cctx) cctx = [CIContext contextWithOptions:nil];
+              CGImageRef cg = [cctx createCGImage:mono.outputImage fromRect:ci.extent];
+              if (!cg) return src;
+              UIImage *monoImg = [UIImage imageWithCGImage:cg scale:sc orientation:UIImageOrientationUp];
+              CGImageRelease(cg);
+
+              UIGraphicsBeginImageContextWithOptions(sz, NO, sc);
+              CGContextRef c = UIGraphicsGetCurrentContext();
+              [src drawInRect:r];
+              CGContextSetBlendMode(c, kCGBlendModeSourceIn);
+              [[UIColor colorWithWhite:0.08 alpha:1.0] setFill];
+              CGContextFillRect(c, r);
+              CGContextSetBlendMode(c, kCGBlendModeNormal);
+              [monoImg drawInRect:r];
+              UIImage *out = UIGraphicsGetImageFromCurrentImageContext();
+              UIGraphicsEndImageContext();
+
+              if (!out) return src;
+              objc_setAssociatedObject(src, &kCacheKey, out, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+              return out;
+          }
+
+          %hook SBIconImageView
+          - (UIImage *)contentsImage {
+              UIImage *o = %orig;
+              if (val(@"enabled", 1) < 0.5) return o;
+              return tinted(o);
+          }
+          %end
+
+          %hook SBIconView
+          - (void)layoutSubviews {
+              %orig;
+              if (val(@"enabled", 1) < 0.5) return;
+              @try {
+                  UIView *img = [self valueForKey:@"_iconImageView"];
+                  float s = val(@"size", 1.0);
+                  if (img) img.transform = CGAffineTransformMakeScale(s, s);
+
+                  UIView *lbl = [self valueForKey:@"_labelView"];
+                  if (lbl) lbl.hidden = val(@"hideLabels", 0) > 0.5;
+              } @catch (NSException *e) {}
+          }
+          %end
+          CMI_EOF
+          mkdir -p layout/Library/PreferenceLoader/Preferences
+          cat > layout/Library/PreferenceLoader/Preferences/ColorMyIcons.plist <<'CMI_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>entry</key><dict>
+          <key>bundle</key><string>ColorMyIconsPrefs</string>
+          <key>cell</key><string>PSLinkCell</string>
+          <key>detail</key><string>CMIRootListController</string>
+          <key>isController</key><true/>
+          <key>label</key><string>ColorMyIcons</string>
+          </dict></dict></plist>
+          CMI_EOF
+          mkdir -p colormyiconsprefs
+          cat > colormyiconsprefs/Makefile <<'CMI_EOF'
+          TARGET = iphone:clang:14.5:12.0
+          ARCHS = arm64
+          include $(THEOS)/makefiles/common.mk
+
+          BUNDLE_NAME = ColorMyIconsPrefs
+          ColorMyIconsPrefs_FILES = CMIRootListController.m
+          ColorMyIconsPrefs_INSTALL_PATH = /Library/PreferenceBundles
+          ColorMyIconsPrefs_FRAMEWORKS = UIKit
+          ColorMyIconsPrefs_PRIVATE_FRAMEWORKS = Preferences
+          ColorMyIconsPrefs_CFLAGS = -fobjc-arc
+
+          include $(THEOS_MAKE_PATH)/bundle.mk
+          CMI_EOF
+          mkdir -p colormyiconsprefs
+          cat > colormyiconsprefs/CMIRootListController.h <<'CMI_EOF'
+          #import <Preferences/PSListController.h>
+
+          @interface CMIRootListController : PSListController
+          @end
+          CMI_EOF
+          mkdir -p colormyiconsprefs
+          cat > colormyiconsprefs/CMIRootListController.m <<'CMI_EOF'
+          #import "CMIRootListController.h"
+          #include <spawn.h>
+
+          @implementation CMIRootListController
+
+          - (NSArray *)specifiers {
+              if (!_specifiers) {
+                  _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+              }
+              return _specifiers;
+          }
+
+          - (void)respring {
+              pid_t pid;
+              const char *args[] = {"killall", "-9", "SpringBoard", NULL};
+              posix_spawnp(&pid, "killall", NULL, NULL, (char *const *)args, NULL);
+          }
+
+          @end
+          CMI_EOF
+          mkdir -p colormyiconsprefs/Resources
+          cat > colormyiconsprefs/Resources/Info.plist <<'CMI_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleDevelopmentRegion</key><string>en</string>
+          <key>CFBundleExecutable</key><string>ColorMyIconsPrefs</string>
+          <key>CFBundleIdentifier</key><string>com.jorik28.colormyiconsprefs</string>
+          <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+          <key>CFBundleName</key><string>ColorMyIconsPrefs</string>
+          <key>CFBundlePackageType</key><string>BNDL</string>
+          <key>CFBundleShortVersionString</key><string>1.0</string>
+          <key>CFBundleVersion</key><string>1.0</string>
+          <key>NSPrincipalClass</key><string>CMIRootListController</string>
+          </dict></plist>
+          CMI_EOF
+          mkdir -p colormyiconsprefs/Resources
+          cat > colormyiconsprefs/Resources/Root.plist <<'CMI_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict><key>title</key><string>ColorMyIcons</string><key>items</key><array>
+          <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>ColorMyIcons</string><key>footerText</key><string>by Claude &amp; Jorik28. Это чистый вайбкодинг: код написан ИИ и почти не тестировался, может глючить. Ставишь на свой страх и риск.</string></dict>
+          <dict><key>cell</key><string>PSSwitchCell</string><key>label</key><string>Включить</string>
+          <key>key</key><string>enabled</string><key>default</key><true/>
+          <key>defaults</key><string>com.jorik28.colormyicons</string></dict>
+          <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Красный</string></dict>
+          <dict><key>cell</key><string>PSSliderCell</string><key>key</key><string>r</string>
+          <key>min</key><real>0</real><key>max</key><real>1</real><key>default</key><real>0.35</real>
+          <key>showValue</key><true/><key>defaults</key><string>com.jorik28.colormyicons</string></dict>
+          <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Зелёный</string></dict>
+          <dict><key>cell</key><string>PSSliderCell</string><key>key</key><string>g</string>
+          <key>min</key><real>0</real><key>max</key><real>1</real><key>default</key><real>0.55</real>
+          <key>showValue</key><true/><key>defaults</key><string>com.jorik28.colormyicons</string></dict>
+          <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Синий</string></dict>
+          <dict><key>cell</key><string>PSSliderCell</string><key>key</key><string>b</string>
+          <key>min</key><real>0</real><key>max</key><real>1</real><key>default</key><real>1</real>
+          <key>showValue</key><true/><key>defaults</key><string>com.jorik28.colormyicons</string></dict>
+          <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Размер иконок (1 = обычный)</string></dict>
+          <dict><key>cell</key><string>PSSliderCell</string><key>key</key><string>size</string>
+          <key>min</key><real>0.5</real><key>max</key><real>1.2</real><key>default</key><real>1</real>
+          <key>showValue</key><true/><key>defaults</key><string>com.jorik28.colormyicons</string></dict>
+          <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string>Подписи</string></dict>
+          <dict><key>cell</key><string>PSSwitchCell</string><key>label</key><string>Скрыть подписи</string>
+          <key>key</key><string>hideLabels</string><key>default</key><false/>
+          <key>defaults</key><string>com.jorik28.colormyicons</string></dict>
+          <dict><key>cell</key><string>PSGroupCell</string><key>label</key><string></string><key>footerText</key><string>Изменения применяются после респринга.</string></dict>
+          <dict><key>cell</key><string>PSButtonCell</string><key>label</key><string>Применить (респринг)</string><key>action</key><string>respring</string></dict>
+          </array></dict></plist>
+          CMI_EOF
+
+      - name: Build
+        run: |
+          cd $HOME/proj
+          make package FINALPACKAGE=1
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ColorMyIcons-deb
+          path: ~/proj/packages/*.deb
